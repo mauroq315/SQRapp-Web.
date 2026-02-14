@@ -24,14 +24,10 @@ st.markdown("""
 def get_google_sheet_client():
     try:
         secrets = st.secrets["gcp_service_account"]
-        
-        # DEFINIMOS LOS SCOPES (PERMISOS) CORRECTOS
-        # Se necesita Drive para encontrar el archivo y Spreadsheets para editarlo
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
-        
         creds = service_account.Credentials.from_service_account_info(secrets, scopes=scopes)
         return gspread.authorize(creds)
     except Exception as e:
@@ -44,31 +40,21 @@ def load_data():
         return None, None, None, None
 
     try:
-        # Intentar abrir la hoja
         sheet = client.open("APP_SQR")
         
-        # Función auxiliar para leer y limpiar
         def leer_hoja(nombre_hoja, columnas_esperadas):
             try:
                 ws = sheet.worksheet(nombre_hoja)
                 data = ws.get_all_records()
                 df = pd.DataFrame(data)
-                
-                # Si está vacío, crear estructura vacía
-                if df.empty:
-                    return pd.DataFrame(columns=columnas_esperadas)
-                
-                # Asegurar que todas las columnas existan
+                if df.empty: return pd.DataFrame(columns=columnas_esperadas)
                 for col in columnas_esperadas:
                     if col not in df.columns:
                         df[col] = 0 if 'Valor' in col or 'Total' in col or 'IVA' in col else ""
-                
                 return df
             except gspread.exceptions.WorksheetNotFound:
-                # Si no existe la pestaña, devolver dataframe vacío
                 return pd.DataFrame(columns=columnas_esperadas)
 
-        # Definir columnas esperadas para evitar KeyErrors
         cols_nomina = ['Trabajador', 'Proyecto Asignado', 'Valor Pactado', 'Pagado', 'Pendiente', 'Estado']
         cols_proyectos = ['Nombre Proyecto', 'Subtotal Venta', 'IVA Generado', 'Total Venta', 'Pagado por Cliente']
         cols_gastos = ['Concepto', 'Categoria', 'Proyecto', 'Monto', 'Fecha']
@@ -77,28 +63,19 @@ def load_data():
         df_proyectos = leer_hoja("proyectos", cols_proyectos)
         df_gastos = leer_hoja("gastos", cols_gastos)
 
-        # --- LIMPIEZA DE DATOS (Anti-Crash) ---
-        
-        # 1. Limpieza Nómina
+        # Limpieza de datos numéricos
         if not df_nomina.empty:
-            # Convertir a texto explícitamente para evitar error de concatenación
             df_nomina['Trabajador'] = df_nomina['Trabajador'].fillna('').astype(str)
             df_nomina['Proyecto Asignado'] = df_nomina['Proyecto Asignado'].fillna('').astype(str)
-            
-            # Convertir números
-            cols_num_nom = ['Valor Pactado', 'Pagado', 'Pendiente']
-            for col in cols_num_nom:
+            for col in ['Valor Pactado', 'Pagado', 'Pendiente']:
                 if col in df_nomina.columns:
                     df_nomina[col] = pd.to_numeric(df_nomina[col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce').fillna(0)
 
-        # 2. Limpieza Proyectos
         if not df_proyectos.empty:
-            cols_num_proy = ['Subtotal Venta', 'IVA Generado', 'Total Venta', 'Pagado por Cliente']
-            for col in cols_num_proy:
+            for col in ['Subtotal Venta', 'IVA Generado', 'Total Venta', 'Pagado por Cliente']:
                 if col in df_proyectos.columns:
                     df_proyectos[col] = pd.to_numeric(df_proyectos[col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce').fillna(0)
 
-        # 3. Limpieza Gastos
         if not df_gastos.empty:
             if 'Monto' in df_gastos.columns:
                 df_gastos['Monto'] = pd.to_numeric(df_gastos['Monto'].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce').fillna(0)
@@ -132,148 +109,138 @@ st.sidebar.button("🔒 Cerrar Sesión", on_click=lambda: st.session_state.updat
 df_n, df_p, df_g, sheet_instance = load_data()
 
 if df_n is None:
-    st.warning("⚠️ MODO OFFLINE: No se encontró 'credentials.json' o la hoja 'APP_SQR'.")
+    st.warning("⚠️ MODO OFFLINE: Revisa la conexión.")
     st.stop()
 else:
-    # Guardar en session state
     st.session_state['nomina'] = df_n
     st.session_state['proyectos'] = df_p
     st.session_state['gastos'] = df_g
 
 st.title("🚀 SQRapp | Gerencia")
 
-# --- TABS ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Equipo", "💰 Ventas", "💳 Gastos", "📊 Rentabilidad", "🏛 Impuestos"])
+# --- NUEVO ORDEN DE TABS ---
+# 1. Proyectos (Origen del dinero) -> 2. Equipo (Destino del dinero) -> 3. Gastos -> 4. Resultados
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["💰 1. Proyectos (Ventas)", "👥 2. Squads (Equipo)", "💳 3. Gastos", "📊 Rentabilidad", "🏛 Impuestos"])
 
-# --- TAB 1: EQUIPO (Nómina) ---
+# --- TAB 1: PROYECTOS (VENTAS) ---
 with tab1:
-    st.header("Nuevo Contrato / Servicio")
+    st.header("Paso 1: Registrar Nuevo Proyecto")
+    st.info("Registra aquí el contrato cerrado con el cliente. Esto creará el 'centro de costos' para asignar equipo.")
+    
+    with st.form("form_venta"):
+        v_nombre = st.text_input("Nombre del Proyecto / Cliente (Ej: Edificio Alpha)")
+        c1, c2 = st.columns(2)
+        v_subtotal = c1.number_input("Valor del Contrato (Antes de IVA)", min_value=0.0)
+        v_iva = c2.number_input("IVA (19%)", value=v_subtotal*0.19)
+        v_total = v_subtotal + v_iva
+        st.write(f"**Total Venta con IVA:** ${v_total:,.2f}")
+        
+        if st.form_submit_button("Crear Proyecto"):
+            try:
+                ws_proy = sheet_instance.worksheet("proyectos")
+                ws_proy.append_row([v_nombre, v_subtotal, v_iva, v_total, 0])
+                st.success(f"Proyecto '{v_nombre}' creado exitosamente. Ahora puedes asignarle equipo en la pestaña 2.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    st.markdown("---")
+    st.subheader("Proyectos Activos")
+    if not st.session_state['proyectos'].empty:
+        st.dataframe(st.session_state['proyectos'])
+
+# --- TAB 2: EQUIPO (SQUADS) ---
+with tab2:
+    st.header("Paso 2: Asignar Equipo al Proyecto")
+    st.info("Asigna arquitectos o proveedores a los proyectos creados en el Paso 1.")
+    
+    # Obtener lista de proyectos actualizada
+    lista_proyectos = []
+    if not st.session_state['proyectos'].empty and 'Nombre Proyecto' in st.session_state['proyectos'].columns:
+        lista_proyectos = st.session_state['proyectos']['Nombre Proyecto'].unique().tolist()
+        lista_proyectos = [p for p in lista_proyectos if str(p).strip() != ""]
+    
+    if not lista_proyectos:
+        st.warning("⚠️ No hay proyectos creados aún. Ve a la pestaña '1. Proyectos' primero.")
     
     with st.form("form_nomina"):
         col1, col2 = st.columns(2)
-        nombre = col1.text_input("Nombre Colaborador/Proveedor")
+        nombre = col1.text_input("Nombre del Arquitecto / Squad")
         
-        # Obtener lista de proyectos única, manejando vacíos
-        lista_proyectos = ["General"]
-        if not st.session_state['proyectos'].empty and 'Nombre Proyecto' in st.session_state['proyectos'].columns:
-            proyectos_existentes = st.session_state['proyectos']['Nombre Proyecto'].unique().tolist()
-            # Filtrar vacíos y agregar
-            proyectos_existentes = [p for p in proyectos_existentes if str(p).strip() != ""]
-            lista_proyectos.extend(proyectos_existentes)
-            
-        proyecto = col2.selectbox("Proyecto Asignado", options=lista_proyectos)
-        valor = st.number_input("Valor Total del Acuerdo", min_value=0.0, step=1000.0)
+        # El selectbox ahora depende de los proyectos existentes
+        proyecto = col2.selectbox("Asignar al Proyecto:", options=lista_proyectos if lista_proyectos else ["General"])
         
-        submitted = st.form_submit_button("Registrar Contrato")
+        valor = st.number_input("Honorarios / Costo Total", min_value=0.0, step=1000.0)
+        
+        submitted = st.form_submit_button("Asignar al Squad")
         if submitted and nombre:
             try:
                 ws_nom = sheet_instance.worksheet("nomina")
                 ws_nom.append_row([nombre, proyecto, valor, 0, valor, "Pendiente"])
-                st.success("Contrato registrado!")
+                st.success(f"{nombre} asignado al proyecto {proyecto}!")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error guardando: {e}")
 
     st.markdown("---")
-    st.header("Registrar Pago / Anticipo")
+    st.header("Gestión de Pagos a Squads")
     
     if not st.session_state['nomina'].empty:
-        # CREAR LA REFERENCIA DE FORMA SEGURA
         df_display = st.session_state['nomina'].copy()
-        
-        # Esta es la línea que arregla tu error:
         df_display['Ref'] = df_display['Trabajador'].astype(str) + " - " + df_display['Proyecto Asignado'].astype(str)
-        
-        # Filtrar solo los que tienen saldo pendiente > 0
         pendientes = df_display[df_display['Pendiente'] > 0]
         
         if not pendientes.empty:
-            opcion = st.selectbox("Seleccionar Contrato", pendientes['Ref'].tolist())
-            pago = st.number_input("Monto a Pagar", min_value=0.0, step=1000.0)
+            opcion = st.selectbox("Seleccionar Pago Pendiente", pendientes['Ref'].tolist())
+            pago = st.number_input("Monto a Pagar Hoy", min_value=0.0, step=1000.0)
             
             if st.button("Registrar Pago"):
                 try:
                     idx = df_display[df_display['Ref'] == opcion].index[0]
-                    # +2 porque google sheets empieza en 1 y tiene header
                     row_num = idx + 2 
-                    
                     ws_nom = sheet_instance.worksheet("nomina")
-                    
-                    # Obtener valores actuales
                     pagado_actual = float(str(df_display.at[idx, 'Pagado']).replace(',',''))
                     valor_total = float(str(df_display.at[idx, 'Valor Pactado']).replace(',',''))
-                    
                     nuevo_pagado = pagado_actual + pago
                     nuevo_pendiente = valor_total - nuevo_pagado
                     nuevo_estado = "Pagado" if nuevo_pendiente <= 0 else "Pendiente"
-                    
-                    # Actualizar celdas (Col D, E, F)
                     ws_nom.update_cell(row_num, 4, nuevo_pagado)
                     ws_nom.update_cell(row_num, 5, nuevo_pendiente)
                     ws_nom.update_cell(row_num, 6, nuevo_estado)
-                    
                     st.success("Pago registrado!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error actualizando: {e}")
         else:
-            st.info("No hay pagos pendientes.")
-    else:
-        st.info("No hay datos de nómina aún.")
-
-# --- TAB 2: VENTAS ---
-with tab2:
-    st.header("Registrar Venta")
-    with st.form("form_venta"):
-        v_nombre = st.text_input("Nombre del Proyecto / Cliente")
-        c1, c2 = st.columns(2)
-        v_subtotal = c1.number_input("Subtotal", min_value=0.0)
-        v_iva = c2.number_input("IVA (19%)", value=v_subtotal*0.19)
-        v_total = v_subtotal + v_iva
-        st.write(f"**Total Venta:** ${v_total:,.2f}")
-        
-        if st.form_submit_button("Guardar Venta"):
-            try:
-                ws_proy = sheet_instance.worksheet("proyectos")
-                ws_proy.append_row([v_nombre, v_subtotal, v_iva, v_total, 0])
-                st.success("Venta guardada")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-    # Métricas
-    if not st.session_state['proyectos'].empty:
-        total_ventas = st.session_state['proyectos']['Total Venta'].sum()
-        cobrado = st.session_state['proyectos']['Pagado por Cliente'].sum()
-        por_cobrar = total_ventas - cobrado
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Ventas Totales", f"${total_ventas:,.0f}")
-        c2.metric("Cobrado", f"${cobrado:,.0f}")
-        c3.metric("Por Cobrar", f"${por_cobrar:,.0f}")
+            st.info("Todos los squads están al día con sus pagos.")
 
 # --- TAB 3: GASTOS ---
 with tab3:
-    st.header("Registrar Gasto")
+    st.header("Paso 3: Registrar Gastos")
+    
     with st.form("form_gasto"):
-        g_concepto = st.text_input("Concepto")
+        g_concepto = st.text_input("Concepto (Ej: Licencia Software, Viáticos)")
+        
+        # Ahora también puedes asignar gastos a proyectos específicos
+        g_proyecto = st.selectbox("Proyecto Relacionado (Opcional)", ["General"] + lista_proyectos)
+        
         g_cat = st.selectbox("Categoría", ["Operativo", "Administrativo", "Marketing", "Impuestos", "Otros"])
         g_monto = st.number_input("Monto", min_value=0.0)
         
         if st.form_submit_button("Guardar Gasto"):
             try:
                 ws_gas = sheet_instance.worksheet("gastos")
-                ws_gas.append_row([g_concepto, g_cat, "General", g_monto, str(datetime.now().date())])
-                st.success("Gasto guardado")
+                ws_gas.append_row([g_concepto, g_cat, g_proyecto, g_monto, str(datetime.now().date())])
+                st.success("Gasto registrado")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
 
 # --- TAB 4: RENTABILIDAD ---
 with tab4:
-    st.header("Estado de Resultados")
+    st.header("Estado de Resultados por Proyecto")
     
-    # Calcular totales seguros
+    # Calcular totales globales
     ventas = st.session_state['proyectos']['Subtotal Venta'].sum() if not st.session_state['proyectos'].empty else 0
     gastos = st.session_state['gastos']['Monto'].sum() if not st.session_state['gastos'].empty else 0
     nomina = st.session_state['nomina']['Valor Pactado'].sum() if not st.session_state['nomina'].empty else 0
@@ -281,28 +248,29 @@ with tab4:
     utilidad = ventas - gastos - nomina
     margen = (utilidad / ventas * 100) if ventas > 0 else 0
     
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ingresos (Subtotal)", f"${ventas:,.0f}")
-    col2.metric("Nómina/Costos", f"${nomina:,.0f}")
-    col3.metric("Gastos Op.", f"${gastos:,.0f}")
-    col4.metric("Utilidad Neta", f"${utilidad:,.0f}", delta=f"{margen:.1f}%")
+    # Métricas Globales
+    st.subheader("Global de la Empresa")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Ventas", f"${ventas:,.0f}")
+    c2.metric("Total Nómina Squads", f"${nomina:,.0f}")
+    c3.metric("Total Gastos", f"${gastos:,.0f}")
+    c4.metric("Utilidad Neta", f"${utilidad:,.0f}", delta=f"{margen:.1f}%")
     
-    # Gráfico
+    st.markdown("---")
+    
+    # Análisis Detallado (Aquí vendría la magia de filtrar por proyecto en el futuro)
+    st.write("📊 *Próximamente: Filtro para ver rentabilidad de cada proyecto individualmente.*")
+    
     datos_grafico = pd.DataFrame({
-        'Concepto': ['Ingresos', 'Nómina', 'Gastos', 'Utilidad'],
+        'Concepto': ['Ingresos', 'Costos Squads', 'Gastos Op.', 'Utilidad'],
         'Monto': [ventas, nomina, gastos, utilidad]
     })
-    fig = px.bar(datos_grafico, x='Concepto', y='Monto', color='Concepto', title="Flujo de Caja")
+    fig = px.bar(datos_grafico, x='Concepto', y='Monto', color='Concepto', title="Flujo de Caja General")
     st.plotly_chart(fig, use_container_width=True)
 
 # --- TAB 5: IMPUESTOS ---
 with tab5:
     st.header("Estimación de Impuestos")
-    
     iva_generado = st.session_state['proyectos']['IVA Generado'].sum() if not st.session_state['proyectos'].empty else 0
-    
-    # Aquí podrías restar IVA descontable si lo tuvieras en gastos
-    iva_pagar = iva_generado 
-    
-    st.metric("IVA a Pagar (Aprox)", f"${iva_pagar:,.0f}")
-    st.info("Este cálculo es solo una estimación basada en las ventas registradas con IVA.")
+    st.metric("IVA Recaudado (A Pagar a DIAN)", f"${iva_generado:,.0f}")
+    st.info("Recuerda: Este valor NO es tuyo, es del estado. No te lo gastes 😉")
