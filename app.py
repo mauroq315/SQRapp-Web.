@@ -7,12 +7,9 @@ from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import imaplib
 import email
-from email.header import decode_header
 import zipfile
 import io
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import numpy as np
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="SQRapp Pro", layout="wide", page_icon="🚀")
@@ -26,13 +23,22 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- UTILIDAD DE FORMATO (PUNTO DE MILES) ---
+# --- UTILIDADES DE FORMATO ---
 def fmt_money(x):
+    """Convierte número a formato visual $ 1.000.000"""
+    if pd.isna(x) or x == "": return "$ 0"
     try:
-        # Formato: $ 1.000.000 (Punto para miles, sin decimales)
         return "${:,.0f}".format(float(x)).replace(",", ".")
     except:
-        return x
+        return str(x)
+
+def clean_colombian_money(series):
+    """Limpia columnas con formato 1.000.000,00 para que Python entienda"""
+    s = series.astype(str)
+    s = s.str.replace('$', '', regex=False).str.replace(' ', '', regex=False)
+    s = s.str.replace('.', '', regex=False) # Quita puntos de miles
+    s = s.str.replace(',', '.', regex=False) # Cambia coma decimal a punto
+    return pd.to_numeric(s, errors='coerce').fillna(0)
 
 # --- CONEXIÓN GOOGLE SHEETS ---
 def get_client():
@@ -48,17 +54,22 @@ def load_data():
     if not client: return None, None, None, None
     try:
         sh = client.open("APP_SQR")
+        
         def get_df(name, cols):
             try:
                 ws = sh.worksheet(name)
-                df = pd.DataFrame(ws.get_all_records())
-                # Asegurar columnas mínimas
+                data = ws.get_all_records()
+                df = pd.DataFrame(data)
+                
+                # Asegurar columnas
                 for c in cols: 
-                    if c not in df.columns: df[c] = 0 if any(x in c for x in ['Valor', 'IVA', 'Total', 'Monto', 'Pagado', 'Saldo', 'Base']) else ""
-                # Limpieza numérica agresiva
-                for c in df.columns:
-                    if any(x in c for x in ['Valor', 'Total', 'IVA', 'Monto', 'Pagado', 'Saldo', 'Base']):
-                        df[c] = pd.to_numeric(df[c].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce').fillna(0)
+                    if c not in df.columns: 
+                        df[c] = 0 if any(x in c for x in ['Valor', 'Total', 'IVA', 'Monto', 'Pagado', 'Saldo', 'Base']) else ""
+                
+                # Limpieza numérica
+                cols_to_clean = [c for c in df.columns if any(x in c for x in ['Valor', 'Total', 'IVA', 'Monto', 'Pagado', 'Saldo', 'Base'])]
+                for c in cols_to_clean:
+                    df[c] = clean_colombian_money(df[c])
                 return df
             except: return pd.DataFrame(columns=cols)
 
@@ -136,6 +147,7 @@ def run_email_sync(sheet_instance):
                                     for ex_ref in existing_refs:
                                         if ref in ex_ref: is_duplicate = True
                                     if not is_duplicate:
+                                        # Se asigna "POR CLASIFICAR" inicialmente
                                         ws_gastos.append_row([str(datetime.now().date()), prov, f"Factura {ref}", "POR CLASIFICAR", base, iva, total, "Gasto General", "Auto-Email"])
                                         reporte_log.append(f"✅ Factura {ref} de {prov} detectada.")
                                         nuevos_gastos += 1
@@ -149,7 +161,7 @@ def run_email_sync(sheet_instance):
 df_p, df_g, df_n, sh = load_data()
 
 # SIDEBAR
-st.sidebar.title("🚀 SQRapp Pro")
+st.sidebar.title("🚀 SQRapp Pro v3")
 if st.sidebar.button("🔄 Sincronizar Todo"):
     logs, count = run_email_sync(sh)
     if count > 0: st.success(f"{count} facturas nuevas.")
@@ -179,40 +191,37 @@ if menu == "📊 Inteligencia de Negocio":
     
     with tab1:
         st.subheader("Rentabilidad por Proyecto")
+        
+        # Agrupación estricta por nombre de proyecto
         gastos_por_proy = df_g.groupby('Proyecto Asignado')['Base'].sum().reset_index()
         nomina_por_proy = df_n.groupby('Proyecto')['Valor Pactado'].sum().reset_index()
         
-        df_rent = df_p[['Proyecto', 'Total Venta', 'Cliente']].copy()
+        df_rent = df_p[['Proyecto', 'Total Venta']].copy()
+        # Merge Left para mantener todos los proyectos activos
         df_rent = df_rent.merge(gastos_por_proy, left_on='Proyecto', right_on='Proyecto Asignado', how='left').fillna(0)
         df_rent = df_rent.merge(nomina_por_proy, left_on='Proyecto', right_on='Proyecto', how='left').fillna(0)
         
         df_rent['Costo Total'] = df_rent['Base'] + df_rent['Valor Pactado']
         df_rent['Utilidad'] = df_rent['Total Venta'] - df_rent['Costo Total']
-        df_rent['Margen %'] = (df_rent['Utilidad'] / df_rent['Total Venta'] * 100).round(1)
+        df_rent['Margen %'] = np.where(df_rent['Total Venta'] > 0, (df_rent['Utilidad'] / df_rent['Total Venta'] * 100), 0)
         
         df_final = df_rent[['Proyecto', 'Total Venta', 'Base', 'Valor Pactado', 'Utilidad', 'Margen %']]
         df_final.columns = ['Proyecto', 'Venta', 'Gastos (Mat/Var)', 'Mano de Obra', 'Ganancia', 'Margen %']
         
-        # Formato aplicado a columnas específicas
         st.dataframe(df_final.style.format({
-            'Venta': fmt_money, 
-            'Gastos (Mat/Var)': fmt_money, 
-            'Mano de Obra': fmt_money, 
-            'Ganancia': fmt_money, 
-            'Margen %': '{:.1f}%'
+            'Venta': fmt_money, 'Gastos (Mat/Var)': fmt_money, 'Mano de Obra': fmt_money, 
+            'Ganancia': fmt_money, 'Margen %': '{:.1f}%'
         }).background_gradient(subset=['Ganancia'], cmap='RdYlGn'))
+
+        # Gráfico Resumen
+        fig = px.bar(df_rent, x='Proyecto', y=['Utilidad', 'Costo Total'], title="Composición de Proyectos", barmode='stack')
+        st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         st.subheader("Estado de Cuenta del Equipo")
-        df_team = df_n.groupby(['Especialista', 'Proyecto'])[['Valor Pactado', 'Pagado', 'Saldo Debe']].sum().reset_index()
-        
-        persona = st.selectbox("Filtrar por Persona", ["Todos"] + df_team['Especialista'].unique().tolist())
-        if persona != "Todos":
-            df_team = df_team[df_team['Especialista'] == persona]
-        
+        df_team = df_n.groupby(['Especialista'])[['Valor Pactado', 'Pagado', 'Saldo Debe']].sum().reset_index()
         st.dataframe(df_team.style.format({'Valor Pactado': fmt_money, 'Pagado': fmt_money, 'Saldo Debe': fmt_money}))
-        st.info(f"💰 Deuda Total Filtrada: {fmt_money(df_team['Saldo Debe'].sum())}")
-
+        
     with tab3:
         st.subheader("Cruce de IVA")
         iva_gen = df_p['IVA Generado'].sum()
@@ -223,6 +232,14 @@ if menu == "📊 Inteligencia de Negocio":
 elif menu == "💰 Gestión de Proyectos":
     st.title("Gestión de Proyectos")
     
+    # REPORTE RÁPIDO DE PROYECTOS
+    col_r1, col_r2 = st.columns([2, 1])
+    with col_r1:
+        fig_p = px.bar(df_p, x="Proyecto", y=["Pagado Cliente", "Saldo Pendiente"], title="Estado de Cartera (Cobros)")
+        st.plotly_chart(fig_p, use_container_width=True)
+    with col_r2:
+        st.info("💡 Este gráfico muestra cuánto dinero ya entró (Azul) y cuánto falta por cobrar (Rojo).")
+
     with st.expander("➕ Crear Nuevo Proyecto"):
         with st.form("new_p"):
             c1, c2 = st.columns(2)
@@ -243,11 +260,8 @@ elif menu == "💰 Gestión de Proyectos":
     
     st.subheader("Cartera (Cuentas por Cobrar)")
     df_cobrar = df_p[['Cliente', 'Proyecto', 'Total Venta', 'Pagado Cliente', 'Saldo Pendiente']].copy()
-    
     st.dataframe(df_cobrar.style.format({
-        'Total Venta': fmt_money, 
-        'Pagado Cliente': fmt_money, 
-        'Saldo Pendiente': fmt_money
+        'Total Venta': fmt_money, 'Pagado Cliente': fmt_money, 'Saldo Pendiente': fmt_money
     }))
     
     with st.form("abono_cliente"):
@@ -260,9 +274,10 @@ elif menu == "💰 Gestión de Proyectos":
             cell = sh.worksheet("proyectos").find(proy_abono)
             if cell:
                 row = cell.row
-                curr_pagado = float(sh.worksheet("proyectos").cell(row, 6).value or 0)
-                venta_base = float(sh.worksheet("proyectos").cell(row, 4).value)
-                iva_val = float(sh.worksheet("proyectos").cell(row, 5).value)
+                # Lectura segura de valores
+                curr_pagado = float(str(sh.worksheet("proyectos").cell(row, 6).value).replace('.','').replace(',','.') or 0)
+                venta_base = float(str(sh.worksheet("proyectos").cell(row, 4).value).replace('.','').replace(',','.') or 0)
+                iva_val = float(str(sh.worksheet("proyectos").cell(row, 5).value).replace('.','').replace(',','.') or 0)
                 total_real = venta_base + iva_val
                 
                 nuevo_pagado = curr_pagado + monto_abono
@@ -275,7 +290,21 @@ elif menu == "💰 Gestión de Proyectos":
 elif menu == "📥 Gastos & Compras":
     st.title("Control de Gastos")
     
-    with st.expander("📝 Registrar Gasto Manual", expanded=True):
+    # REPORTE RÁPIDO DE GASTOS
+    c_g1, c_g2 = st.columns(2)
+    with c_g1:
+        # Agrupar gastos por categoría
+        if not df_g.empty:
+            fig_cat = px.pie(df_g, values='Base', names='Categoria', title="Gastos por Categoría", hole=0.4)
+            st.plotly_chart(fig_cat, use_container_width=True)
+    with c_g2:
+        # Agrupar gastos por Proyecto
+        if not df_g.empty:
+            gastos_clean = df_g[df_g['Proyecto Asignado'] != "POR CLASIFICAR"]
+            fig_proy = px.bar(gastos_clean, x='Proyecto Asignado', y='Base', title="Gastos por Proyecto")
+            st.plotly_chart(fig_proy, use_container_width=True)
+
+    with st.expander("📝 Registrar Gasto Manual", expanded=False):
         with st.form("gasto_manual"):
             c1, c2, c3 = st.columns(3)
             fecha = c1.date_input("Fecha")
@@ -293,22 +322,37 @@ elif menu == "📥 Gastos & Compras":
     
     st.subheader("🤖 Facturas Detectadas (Pendientes)")
     pendientes = df_g[df_g['Proyecto Asignado'] == "POR CLASIFICAR"]
+    
     if not pendientes.empty:
         st.dataframe(pendientes.style.format({
             'Base': fmt_money, 'IVA Descontable': fmt_money, 'Total Gasto': fmt_money
         }))
+        
+        st.write("### ⚡ Clasificación Rápida")
         with st.form("clasif_express"):
-            f_id = st.selectbox("Factura", pendientes['Concepto'])
-            p_dest = st.selectbox("Mover a Proyecto:", df_p['Proyecto'].unique().tolist() + ["Gasto General"])
-            c_dest = st.selectbox("Categoría:", ["Materiales", "Equipos", "Servicios"])
-            if st.form_submit_button("Asignar"):
-                cell = sh.worksheet("gastos").find(f_id)
-                sh.worksheet("gastos").update_cell(cell.row, 4, p_dest)
-                sh.worksheet("gastos").update_cell(cell.row, 8, c_dest)
-                st.rerun()
-    else: st.info("Buzón limpio.")
+            c_sel, c_proy, c_cat = st.columns(3)
+            f_id = c_sel.selectbox("Seleccionar Factura", pendientes['Concepto'].unique())
+            p_dest = c_proy.selectbox("Mover a Proyecto:", df_p['Proyecto'].unique().tolist() + ["Gasto General"])
+            c_dest = c_cat.selectbox("Categoría:", ["Materiales", "Equipos", "Servicios", "Transporte"])
+            
+            if st.form_submit_button("Asignar Gasto"):
+                # Búsqueda más robusta: Buscar en la columna C (Concepto)
+                try:
+                    cell = sh.worksheet("gastos").find(f_id, in_column=3)
+                    if cell:
+                        # Actualizar Proyecto (Col 4) y Categoría (Col 8)
+                        sh.worksheet("gastos").update_cell(cell.row, 4, p_dest)
+                        sh.worksheet("gastos").update_cell(cell.row, 8, c_dest)
+                        st.success(f"Factura asignada a {p_dest}")
+                        st.rerun()
+                    else:
+                        st.error("No se encontró la factura en la hoja.")
+                except Exception as e:
+                    st.error(f"Error al actualizar: {e}")
+    else: 
+        st.info("✅ No tienes facturas pendientes de clasificar.")
     
-    st.subheader("Historial")
+    st.markdown("### Historial Completo")
     st.dataframe(df_g.style.format({
         'Base': fmt_money, 'IVA Descontable': fmt_money, 'Total Gasto': fmt_money
     }))
@@ -316,6 +360,11 @@ elif menu == "📥 Gastos & Compras":
 # --- 4. NÓMINA ---
 elif menu == "👥 Nómina & Equipo":
     st.title("Gestión de Equipo")
+    
+    # REPORTE DE NÓMINA
+    if not df_n.empty:
+        fig_nom = px.bar(df_n, x="Especialista", y=["Pagado", "Saldo Debe"], title="Pagos vs Deuda por Persona", barmode='group')
+        st.plotly_chart(fig_nom, use_container_width=True)
     
     c1, c2 = st.columns(2)
     with c1.form("asignar_tarea"):
@@ -339,6 +388,8 @@ elif menu == "👥 Nómina & Equipo":
             if st.form_submit_button("Pagar"):
                 nombre_sel = seleccion.split(" - ")[0]
                 proy_sel = seleccion.split(" - ")[1].split(" ($")[0]
+                
+                # Lógica de búsqueda manual para evitar errores de find()
                 all_data = sh.worksheet("nomina").get_all_records()
                 row_idx = -1
                 for i, row in enumerate(all_data):
@@ -346,8 +397,8 @@ elif menu == "👥 Nómina & Equipo":
                         row_idx = i + 2
                         break
                 if row_idx > 0:
-                    curr_pagado = float(str(sh.worksheet("nomina").cell(row_idx, 6).value).replace(',','').replace('$',''))
-                    curr_pactado = float(str(sh.worksheet("nomina").cell(row_idx, 5).value).replace(',','').replace('$',''))
+                    curr_pagado = float(str(sh.worksheet("nomina").cell(row_idx, 6).value).replace('.','').replace(',','.'))
+                    curr_pactado = float(str(sh.worksheet("nomina").cell(row_idx, 5).value).replace('.','').replace(',','.'))
                     nuevo_pagado = curr_pagado + monto
                     sh.worksheet("nomina").update_cell(row_idx, 6, nuevo_pagado)
                     sh.worksheet("nomina").update_cell(row_idx, 7, curr_pactado - nuevo_pagado)
