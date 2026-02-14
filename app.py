@@ -22,12 +22,13 @@ st.markdown("""
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #1e2130; border-radius: 4px; color: white; }
     .stTabs [aria-selected="true"] { background-color: #4CAF50; color: white; }
+    .iva-box { padding: 20px; border-radius: 10px; text-align: center; color: white; margin-bottom: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
 # --- UTILIDADES ---
 def fmt_money(x):
-    if pd.isna(x) or x == "": return "$ 0"
+    if pd.isna(x) or str(x).strip() == "": return "$ 0"
     try: return "${:,.0f}".format(float(x)).replace(",", ".")
     except: return str(x)
 
@@ -37,7 +38,6 @@ def clean_colombian_money(series):
     return pd.to_numeric(s, errors='coerce').fillna(0)
 
 def clean_text_key(series):
-    """Normaliza nombres para asegurar que crucen bien (quita espacios y mayúsculas)"""
     return series.astype(str).str.strip().str.upper()
 
 # --- CONEXIÓN ---
@@ -54,29 +54,49 @@ def load_data():
     if not client: return None, None, None, None
     try:
         sh = client.open("APP_SQR")
-        def get_df(name, cols):
+        
+        def get_df_robust(name, required_cols):
             try:
                 ws = sh.worksheet(name)
-                df = pd.DataFrame(ws.get_all_records())
-                for c in cols: 
-                    if c not in df.columns: df[c] = 0 if any(x in c for x in ['Valor', 'Total', 'IVA', 'Base']) else ""
+                data = ws.get_all_values()
+                if len(data) < 2: return pd.DataFrame(columns=required_cols)
+                
+                headers = data[0]
+                rows = data[1:]
+                df = pd.DataFrame(rows, columns=headers)
+                
+                # Manejo de columnas duplicadas (como el error de IVA Descontable)
+                df = df.loc[:, ~df.columns.duplicated()]
+                
+                for col in required_cols:
+                    if col not in df.columns: df[col] = ""
+                
+                # Seleccionar columnas requeridas
+                df = df[required_cols].copy()
                 
                 # Limpieza Numérica
                 cols_num = [c for c in df.columns if any(x in c for x in ['Valor', 'Total', 'IVA', 'Monto', 'Pagado', 'Saldo', 'Base'])]
                 for c in cols_num: df[c] = clean_colombian_money(df[c])
-                
                 return df
-            except: return pd.DataFrame(columns=cols)
+            except Exception as e:
+                st.error(f"Error leyendo {name}: {e}")
+                return pd.DataFrame(columns=required_cols)
 
-        df_p = get_df("proyectos", ['ID', 'Cliente', 'Proyecto', 'Total Venta', 'IVA Generado', 'Pagado Cliente', 'Saldo Pendiente', 'Estado', 'Tiene IVA'])
-        df_g = get_df("gastos", ['Fecha', 'Proveedor', 'Concepto', 'Proyecto Asignado', 'Base', 'IVA Descontable', 'Total Gasto', 'Categoria', 'Origen'])
-        df_n = get_df("nomina", ['Fecha', 'Especialista', 'Rol', 'Proyecto', 'Valor Pactado', 'Pagado', 'Saldo Debe'])
+        cols_p = ['ID', 'Cliente', 'Proyecto', 'Total Venta', 'IVA Generado', 'Pagado Cliente', 'Saldo Pendiente', 'Estado', 'Tiene IVA']
+        cols_g = ['Fecha', 'Proveedor', 'Concepto', 'Proyecto Asignado', 'Base', 'IVA Descontable', 'Total Gasto', 'Categoria', 'Origen']
+        cols_n = ['Fecha', 'Especialista', 'Rol', 'Proyecto', 'Valor Pactado', 'Pagado', 'Saldo Debe']
+
+        df_p = get_df_robust("proyectos", cols_p)
+        df_g = get_df_robust("gastos", cols_g)
+        df_n = get_df_robust("nomina", cols_n)
         
-        # --- LIMPIEZA CLAVE PARA CRUCES ---
-        # Creamos columnas "Key" limpias para asegurar que "Proyecto A" cruce con "proyecto a "
+        # Generar Keys
         if not df_p.empty: df_p['Key'] = clean_text_key(df_p['Proyecto'])
+        else: df_p['Key'] = ""
         if not df_g.empty: df_g['Key'] = clean_text_key(df_g['Proyecto Asignado'])
+        else: df_g['Key'] = ""
         if not df_n.empty: df_n['Key'] = clean_text_key(df_n['Proyecto'])
+        else: df_n['Key'] = ""
         
         return df_p, df_g, df_n, sh
     except Exception as e:
@@ -103,7 +123,7 @@ def extract_xml_data(xml_content):
     except: return None, 0, 0, 0, None
 
 def run_email_sync(sheet_instance):
-    st.toast("🤖 Buscando facturas en Gmail...")
+    st.toast("🤖 Buscando facturas...")
     try:
         EMAIL_USER = st.secrets["email"]["user"]
         EMAIL_PASS = st.secrets["email"]["password"]
@@ -116,7 +136,6 @@ def run_email_sync(sheet_instance):
         ws_gastos = sheet_instance.worksheet("gastos")
         existing_refs = [str(x) for x in ws_gastos.col_values(3)] 
         count = 0
-        
         for e_id in email_ids:
             _, msg_data = mail.fetch(e_id, "(RFC822)")
             for response_part in msg_data:
@@ -135,7 +154,6 @@ def run_email_sync(sheet_instance):
                             except: pass
                         elif "xml" in filename.lower():
                             xml_content = part.get_payload(decode=True)
-
                         if xml_content:
                             prov, base, iva, total, ref = extract_xml_data(xml_content)
                             if prov and ref and not any(ref in x for x in existing_refs):
@@ -145,9 +163,7 @@ def run_email_sync(sheet_instance):
         mail.close()
         mail.logout()
         return count
-    except Exception as e: 
-        st.error(f"Error Email: {e}")
-        return 0
+    except Exception as e: return 0
 
 # --- UI ---
 df_p, df_g, df_n, sh = load_data()
@@ -162,205 +178,218 @@ menu = st.sidebar.radio("Menú Principal", ["📊 Dashboard Gerencial", "💰 Pr
 
 # --- 1. DASHBOARD GERENCIAL ---
 if menu == "📊 Dashboard Gerencial":
-    st.title("📊 Visión Global del Negocio")
+    st.title("📊 Visión Global")
     
-    # KPIs Principales
-    ventas = df_p['Total Venta'].sum()
-    gastos = df_g['Base'].sum()
-    nomina = df_n['Valor Pactado'].sum()
-    utilidad = ventas - (gastos + nomina)
+    tab_kpi, tab_iva = st.tabs(["📈 Rentabilidad", "🏛️ Impuestos & IVA"])
     
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Ventas Totales", fmt_money(ventas))
-    k2.metric("Gastos Operativos", fmt_money(gastos))
-    k3.metric("Nómina Total", fmt_money(nomina))
-    k4.metric("Utilidad Neta", fmt_money(utilidad), delta=f"{(utilidad/ventas)*100:.1f}%" if ventas>0 else "0%")
-    
-    st.divider()
-    
-    # TABLA MAESTRA DE RENTABILIDAD
-    st.subheader("🏆 Rentabilidad Real por Proyecto")
-    
-    # Agrupación usando la KEY limpia para asegurar cruces
-    g_proy = df_g.groupby('Key')['Base'].sum().reset_index()
-    n_proy = df_n.groupby('Key')['Valor Pactado'].sum().reset_index()
-    
-    # Merge usando KEY
-    df_master = df_p[['Proyecto', 'Key', 'Total Venta']].copy()
-    df_master = df_master.merge(g_proy, on='Key', how='left').rename(columns={'Base': 'Gastos'})
-    df_master = df_master.merge(n_proy, on='Key', how='left').rename(columns={'Valor Pactado': 'Nomina'})
-    df_master = df_master.fillna(0)
-    
-    df_master['Costo Total'] = df_master['Gastos'] + df_master['Nomina']
-    df_master['Ganancia'] = df_master['Total Venta'] - df_master['Costo Total']
-    df_master['Margen'] = np.where(df_master['Total Venta']>0, (df_master['Ganancia']/df_master['Total Venta']*100), 0)
-    
-    # Visualización
-    st.dataframe(df_master[['Proyecto', 'Total Venta', 'Gastos', 'Nomina', 'Ganancia', 'Margen']].style.format({
-        'Total Venta': fmt_money, 'Gastos': fmt_money, 'Nomina': fmt_money, 
-        'Ganancia': fmt_money, 'Margen': '{:.1f}%'
-    }).background_gradient(subset=['Ganancia'], cmap='RdYlGn'), use_container_width=True)
-    
-    col_g1, col_g2 = st.columns(2)
-    with col_g1:
-        st.caption("Distribución de Costos por Proyecto")
-        fig = px.bar(df_master, x='Proyecto', y=['Gastos', 'Nomina'], title="Gastos vs Nómina", barmode='stack')
-        st.plotly_chart(fig, use_container_width=True)
+    with tab_kpi:
+        ventas = df_p['Total Venta'].sum()
+        gastos = df_g['Base'].sum()
+        nomina = df_n['Valor Pactado'].sum()
+        utilidad = ventas - (gastos + nomina)
+        
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Ventas Totales", fmt_money(ventas))
+        k2.metric("Gastos (Base)", fmt_money(gastos))
+        k3.metric("Nómina", fmt_money(nomina))
+        k4.metric("Utilidad Neta", fmt_money(utilidad), delta=f"{(utilidad/ventas)*100:.1f}%" if ventas>0 else "0%")
+        
+        st.divider()
+        st.subheader("🏆 Rentabilidad por Proyecto")
+        if not df_p.empty:
+            g_proy = df_g.groupby('Key')['Base'].sum().reset_index() if not df_g.empty else pd.DataFrame()
+            n_proy = df_n.groupby('Key')['Valor Pactado'].sum().reset_index() if not df_n.empty else pd.DataFrame()
+            
+            df_master = df_p[['Proyecto', 'Key', 'Total Venta']].copy()
+            if not g_proy.empty: df_master = df_master.merge(g_proy, on='Key', how='left').rename(columns={'Base': 'Gastos'})
+            else: df_master['Gastos'] = 0
+            if not n_proy.empty: df_master = df_master.merge(n_proy, on='Key', how='left').rename(columns={'Valor Pactado': 'Nomina'})
+            else: df_master['Nomina'] = 0
+            
+            df_master = df_master.fillna(0)
+            df_master['Ganancia'] = df_master['Total Venta'] - (df_master['Gastos'] + df_master['Nomina'])
+            
+            st.dataframe(df_master[['Proyecto', 'Total Venta', 'Gastos', 'Nomina', 'Ganancia']].style.format(fmt_money).background_gradient(subset=['Ganancia'], cmap='RdYlGn'), use_container_width=True)
+
+    with tab_iva:
+        st.subheader("Cruce de Cuentas con DIAN")
+        
+        iva_generado = df_p['IVA Generado'].sum()
+        iva_descontable = df_g['IVA Descontable'].sum()
+        iva_pagar = iva_generado - iva_descontable
+        
+        c_iva1, c_iva2, c_iva3 = st.columns(3)
+        
+        c_iva1.markdown(f"""
+        <div class="iva-box" style="background-color: #2e7d32;">
+            <h3>IVA Generado</h3>
+            <h2>{fmt_money(iva_generado)}</h2>
+            <p>Cobrado a Clientes</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        c_iva2.markdown(f"""
+        <div class="iva-box" style="background-color: #c62828;">
+            <h3>IVA Descontable</h3>
+            <h2>{fmt_money(iva_descontable)}</h2>
+            <p>Pagado en Compras</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        color_final = "#fbc02d" if iva_pagar > 0 else "#1565c0"
+        texto_final = "A PAGAR A DIAN" if iva_pagar > 0 else "SALDO A FAVOR"
+        
+        c_iva3.markdown(f"""
+        <div class="iva-box" style="background-color: {color_final}; color: black;">
+            <h3>{texto_final}</h3>
+            <h2>{fmt_money(abs(iva_pagar))}</h2>
+            <p>Posición Neta</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.info("💡 Recuerda: El IVA Descontable solo aplica si pediste factura electrónica a nombre de la empresa.")
 
 # --- 2. PROYECTOS ---
 elif menu == "💰 Proyectos & Obras":
     st.title("Gestión de Proyectos")
-    
     tab_p1, tab_p2 = st.tabs(["📂 Mis Proyectos", "➕ Nuevo Proyecto"])
     
     with tab_p1:
-        st.subheader("Estado de Cartera")
-        df_cobro = df_p[['Proyecto', 'Cliente', 'Total Venta', 'Pagado Cliente', 'Saldo Pendiente']]
-        st.dataframe(df_cobro.style.format({
-            'Total Venta': fmt_money, 'Pagado Cliente': fmt_money, 'Saldo Pendiente': fmt_money
-        }), use_container_width=True)
-        
-        with st.expander("💸 Registrar Abono de Cliente"):
+        st.dataframe(df_p[['Proyecto', 'Cliente', 'Total Venta', 'Pagado Cliente', 'Saldo Pendiente']].style.format(fmt_money), use_container_width=True)
+        with st.expander("💸 Registrar Abono"):
             with st.form("abono"):
-                p_sel = st.selectbox("Proyecto", df_p[df_p['Saldo Pendiente']>1]['Proyecto'].unique())
-                m_abono = st.number_input("Monto Abono", min_value=0.0)
-                if st.form_submit_button("Registrar Pago"):
-                    cell = sh.worksheet("proyectos").find(p_sel)
-                    row = cell.row
-                    curr = float(str(sh.worksheet("proyectos").cell(row, 6).value).replace('.','').replace(',','.') or 0)
-                    total = float(str(sh.worksheet("proyectos").cell(row, 7).value).replace('.','').replace(',','.') or 0)
-                    sh.worksheet("proyectos").update_cell(row, 6, curr + m_abono)
-                    sh.worksheet("proyectos").update_cell(row, 7, total - (curr + m_abono))
-                    st.success("Pago registrado")
-                    st.rerun()
+                pendientes = df_p[df_p['Saldo Pendiente'] > 1]
+                if not pendientes.empty:
+                    p_sel = st.selectbox("Proyecto", pendientes['Proyecto'].unique())
+                    m_abono = st.number_input("Monto Abono", min_value=0.0)
+                    if st.form_submit_button("Registrar"):
+                        cell = sh.worksheet("proyectos").find(p_sel)
+                        row = cell.row
+                        curr = float(str(sh.worksheet("proyectos").cell(row, 6).value).replace('.','').replace(',','.') or 0)
+                        total = float(str(sh.worksheet("proyectos").cell(row, 7).value).replace('.','').replace(',','.') or 0)
+                        sh.worksheet("proyectos").update_cell(row, 6, curr + m_abono)
+                        sh.worksheet("proyectos").update_cell(row, 7, total - (curr + m_abono))
+                        st.success("Registrado")
+                        st.rerun()
+                else: st.info("Sin saldos pendientes.")
 
     with tab_p2:
         with st.form("crear_proy"):
             c1, c2 = st.columns(2)
             n_proy = c1.text_input("Nombre Proyecto")
             n_cli = c2.text_input("Cliente")
-            val = st.number_input("Valor Venta", min_value=0)
+            val = st.number_input("Valor Venta (Antes de IVA)", min_value=0)
             iva_bool = st.checkbox("Aplica IVA (19%)")
             if st.form_submit_button("Crear"):
                 iva = val * 0.19 if iva_bool else 0
                 sh.worksheet("proyectos").append_row([
                     int(datetime.now().timestamp()), n_cli, n_proy, val, iva, 0, val+iva, "Activo", "Sí" if iva_bool else "No"
                 ])
-                st.success("Proyecto Creado")
+                st.success("Creado")
                 st.rerun()
 
-# --- 3. GASTOS (NUEVO DISEÑO) ---
+# --- 3. GASTOS ---
 elif menu == "📥 Centro de Gastos":
-    st.title("Control de Gastos y Compras")
+    st.title("Control de Gastos")
+    t_res, t_reg = st.tabs(["📊 Análisis", "📝 Registrar Gasto"])
     
-    # Pestañas para organizar la vista
-    t_resumen, t_detalle, t_registro = st.tabs(["📊 Análisis de Gastos", "📑 Detalle por Proyecto", "📝 Registrar / Clasificar"])
-    
-    with t_resumen:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Gastos Generales vs Proyectos")
-            # Separar gastos asignados de generales
-            df_g['Tipo Gasto'] = np.where(df_g['Proyecto Asignado'].isin(['Gasto General', 'Oficina', 'Varios']), 'Administrativo', 'De Proyecto')
-            fig_tipo = px.pie(df_g, names='Tipo Gasto', values='Base', hole=0.4)
-            st.plotly_chart(fig_tipo, use_container_width=True)
-        with c2:
-            st.subheader("Top Categorías")
-            fig_cat = px.bar(df_g.groupby('Categoria')['Base'].sum().reset_index(), x='Categoria', y='Base')
-            st.plotly_chart(fig_cat, use_container_width=True)
-
-    with t_detalle:
-        st.subheader("Desglose: ¿En qué se gasta cada proyecto?")
-        # Tabla dinámica (Pivot Table)
+    with t_res:
         if not df_g.empty:
-            pivot = df_g.pivot_table(index='Proyecto Asignado', columns='Categoria', values='Base', aggfunc='sum', fill_value=0)
-            # Formatear pivot para visualización
-            st.dataframe(pivot.style.format(fmt_money), use_container_width=True)
-        else:
-            st.info("No hay gastos registrados aún.")
-
-    with t_registro:
-        c_man, c_bot = st.columns([1, 1])
+            c1, c2 = st.columns(2)
+            with c1: st.plotly_chart(px.pie(df_g, names='Categoria', values='Base', title="Por Categoría"), use_container_width=True)
+            with c2: 
+                pivot = df_g.pivot_table(index='Proyecto Asignado', columns='Categoria', values='Base', aggfunc='sum', fill_value=0)
+                st.dataframe(pivot.style.format(fmt_money), use_container_width=True)
+    
+    with t_reg:
+        st.write("### Registrar Gasto Manual")
+        with st.form("gasto_manual"):
+            c1, c2, c3 = st.columns(3)
+            f = c1.date_input("Fecha")
+            p = c2.text_input("Proveedor")
+            conc = c3.text_input("Concepto")
+            
+            c4, c5 = st.columns(2)
+            proy_dest = c4.selectbox("Asignar a:", ["Gasto General"] + df_p['Proyecto'].unique().tolist())
+            cat = c5.selectbox("Categoría", ["Materiales", "Transporte", "Alimentación", "Servicios", "Nómina Extra"])
+            
+            st.divider()
+            st.write("💰 **Detalle del Valor**")
+            cc1, cc2 = st.columns(2)
+            valor_total = cc1.number_input("Valor TOTAL a Pagar", min_value=0.0)
+            tiene_iva = cc2.radio("¿Este valor incluye IVA?", ["No (Exento/Régimen Simple)", "Sí (Tiene IVA 19%)"])
+            
+            if st.form_submit_button("Guardar Gasto"):
+                if "Sí" in tiene_iva:
+                    base = valor_total / 1.19
+                    iva = valor_total - base
+                else:
+                    base = valor_total
+                    iva = 0
+                
+                sh.worksheet("gastos").append_row([str(f), p, conc, proy_dest, base, iva, valor_total, cat, "Manual"])
+                st.success(f"Gasto Guardado. Base: {fmt_money(base)} | IVA: {fmt_money(iva)}")
+                st.rerun()
         
-        with c_man:
-            st.info("📝 Registro Manual")
-            with st.form("gasto_manual"):
-                f = st.date_input("Fecha")
-                p = st.text_input("Proveedor")
-                c = st.text_input("Concepto")
-                # Dropdown estricto desde Proyectos
-                lista_proyectos = ["Gasto General"] + df_p['Proyecto'].unique().tolist()
-                proy_dest = st.selectbox("Asignar a:", lista_proyectos)
-                cat = st.selectbox("Categoría", ["Materiales", "Transporte", "Alimentación", "Servicios", "Nómina Extra"])
-                v = st.number_input("Valor", min_value=0)
-                if st.form_submit_button("Guardar Gasto"):
-                    sh.worksheet("gastos").append_row([str(f), p, c, proy_dest, v, 0, v, cat, "Manual"])
-                    st.success("Guardado")
-                    st.rerun()
-        
-        with c_bot:
-            st.warning("🤖 Facturas del Email (Pendientes)")
-            pend = df_g[df_g['Proyecto Asignado'] == "POR CLASIFICAR"]
-            if not pend.empty:
-                st.dataframe(pend[['Proveedor', 'Total Gasto']])
-                with st.form("bot_assign"):
-                    fact_sel = st.selectbox("Factura", pend['Concepto'].unique())
-                    p_bot = st.selectbox("Mover a:", lista_proyectos)
-                    c_bot_cat = st.selectbox("Cat:", ["Materiales", "Equipos", "Servicios"])
-                    if st.form_submit_button("Clasificar"):
+        # Botón de Robot
+        st.divider()
+        pend = df_g[df_g['Proyecto Asignado'] == "POR CLASIFICAR"]
+        if not pend.empty:
+            st.warning(f"Tienes {len(pend)} facturas del robot pendientes.")
+            with st.form("bot_assign"):
+                fact_sel = st.selectbox("Factura", pend['Concepto'].unique())
+                p_bot = st.selectbox("Mover a:", ["Gasto General"] + df_p['Proyecto'].unique().tolist())
+                c_bot_cat = st.selectbox("Cat:", ["Materiales", "Equipos", "Servicios"])
+                if st.form_submit_button("Clasificar"):
+                    try:
                         cell = sh.worksheet("gastos").find(fact_sel, in_column=3)
                         sh.worksheet("gastos").update_cell(cell.row, 4, p_bot)
                         sh.worksheet("gastos").update_cell(cell.row, 8, c_bot_cat)
                         st.rerun()
-            else:
-                st.success("Todo al día.")
+                    except: st.error("Error actualizando.")
 
 # --- 4. NÓMINA ---
 elif menu == "👥 Equipo & Nómina":
     st.title("Gestión de Personal")
-    
-    tn1, tn2 = st.tabs(["💰 Pagos y Deudas", "👷 Asignar Trabajo"])
+    tn1, tn2 = st.tabs(["💰 Pagos", "👷 Asignar"])
     
     with tn1:
-        st.subheader("Estado de Cuenta por Persona")
         df_team = df_n.groupby(['Especialista'])[['Valor Pactado', 'Pagado', 'Saldo Debe']].sum().reset_index()
-        st.dataframe(df_team.style.format({
-            'Valor Pactado': fmt_money, 'Pagado': fmt_money, 'Saldo Debe': fmt_money
-        }), use_container_width=True)
+        st.dataframe(df_team.style.format(fmt_money), use_container_width=True)
         
-        with st.expander("💸 Registrar Pago a Personal"):
+        with st.expander("💸 Pagar"):
             with st.form("pago_nom"):
                 deudores = df_n[df_n['Saldo Debe']>0]
                 if not deudores.empty:
                     opc = deudores.apply(lambda x: f"{x['Especialista']} | {x['Proyecto']} | Debe: {fmt_money(x['Saldo Debe'])}", axis=1)
-                    sel = st.selectbox("Seleccionar Item a Pagar", opc)
-                    monto = st.number_input("Valor a Pagar", min_value=0.0)
+                    sel = st.selectbox("Item", opc)
+                    monto = st.number_input("Valor", min_value=0.0)
                     if st.form_submit_button("Pagar"):
-                        # Parsing seguro
                         parts = sel.split(" | ")
                         nom_s, proy_s = parts[0], parts[1]
-                        
-                        # Buscar fila exacta
-                        all_rows = sh.worksheet("nomina").get_all_records()
-                        idx = next((i for i, r in enumerate(all_rows) if r['Especialista']==nom_s and r['Proyecto']==proy_s), -1)
-                        
-                        if idx != -1:
-                            row_n = idx + 2
-                            curr = float(str(sh.worksheet("nomina").cell(row_n, 6).value).replace('.','').replace(',','.') or 0)
-                            pact = float(str(sh.worksheet("nomina").cell(row_n, 5).value).replace('.','').replace(',','.') or 0)
-                            sh.worksheet("nomina").update_cell(row_n, 6, curr + monto)
-                            sh.worksheet("nomina").update_cell(row_n, 7, pact - (curr + monto))
-                            st.success("Pago registrado")
+                        all_rows = sh.worksheet("nomina").get_all_values()
+                        row_idx = -1
+                        for i, row in enumerate(all_rows):
+                            if i==0: continue
+                            if len(row)>3 and row[1]==nom_s and row[3]==proy_s:
+                                row_idx = i+1
+                                break
+                        if row_idx != -1:
+                            curr = float(str(sh.worksheet("nomina").cell(row_idx, 6).value).replace('.','').replace(',','.') or 0)
+                            pact = float(str(sh.worksheet("nomina").cell(row_idx, 5).value).replace('.','').replace(',','.') or 0)
+                            sh.worksheet("nomina").update_cell(row_idx, 6, curr + monto)
+                            sh.worksheet("nomina").update_cell(row_idx, 7, pact - (curr + monto))
+                            st.success("Pagado")
                             st.rerun()
-                else: st.info("No hay deudas pendientes.")
+                else: st.info("Al día.")
 
     with tn2:
         with st.form("add_task"):
             c1, c2 = st.columns(2)
-            nom = c1.text_input("Nombre Especialista")
-            rol = c2.selectbox("Rol", ["Instalador", "Ayudante", "Ingeniero", "Arquitecto"])
+            nom = c1.text_input("Nombre")
+            rol = c2.selectbox("Rol", ["Instalador", "Ayudante", "Ingeniero"])
             proy = st.selectbox("Proyecto", df_p['Proyecto'].unique())
-            val = st.number_input("Valor Pactado", min_value=0)
+            val = st.number_input("Valor", min_value=0)
             if st.form_submit_button("Asignar"):
                 sh.worksheet("nomina").append_row([str(datetime.now().date()), nom, rol, proy, val, 0, val])
                 st.success("Asignado")
