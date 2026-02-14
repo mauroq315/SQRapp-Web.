@@ -24,7 +24,15 @@ st.markdown("""
 def get_google_sheet_client():
     try:
         secrets = st.secrets["gcp_service_account"]
-        creds = service_account.Credentials.from_service_account_info(secrets, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        
+        # DEFINIMOS LOS SCOPES (PERMISOS) CORRECTOS
+        # Se necesita Drive para encontrar el archivo y Spreadsheets para editarlo
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        creds = service_account.Credentials.from_service_account_info(secrets, scopes=scopes)
         return gspread.authorize(creds)
     except Exception as e:
         st.error(f"Error de credenciales: {e}")
