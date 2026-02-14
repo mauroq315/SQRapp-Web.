@@ -3,61 +3,53 @@ import pandas as pd
 import plotly.express as px
 from google.oauth2 import service_account
 import gspread
-from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
-import imaplib
-import email
-import zipfile
-import io
+from datetime import datetime
 import numpy as np
 
-# --- CONFIGURACIÓN VISUAL ---
-st.set_page_config(page_title="SQRapp", layout="wide", page_icon="🏗️")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="SQRapp Control", layout="wide", page_icon="🛠️")
 
-# --- ESTILOS MODERNOS ---
+# --- ESTILOS ---
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
-    /* Tabs grandes y fáciles de tocar */
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { 
-        height: 60px; 
-        background-color: #1e2130; 
-        border-radius: 10px; 
-        color: white; 
-        font-size: 18px;
-        font-weight: bold;
-        padding: 0 20px;
-    }
-    .stTabs [aria-selected="true"] { 
-        background-color: #4CAF50; 
-        color: white; 
-        border: 2px solid #81C784;
-    }
-    /* Tarjetas de métricas */
-    div[data-testid="metric-container"] {
-        background-color: #262730;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #4CAF50;
-    }
+    .stButton button { width: 100%; border-radius: 5px; font-weight: bold; }
+    div[data-testid="stMetricValue"] { font-size: 24px; }
+    .save-btn { background-color: #4CAF50 !important; color: white !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- FUNCIONES DE SOPORTE (Iguales a la versión robusta) ---
+# --- FUNCIONES DE LIMPIEZA ROBUSTA ---
+def clean_money_value(val):
+    """Convierte cualquier formato de moneda (texto o numero) a float puro"""
+    if pd.isna(val) or str(val).strip() == "": return 0.0
+    s = str(val).strip()
+    # Quitar símbolos de moneda y espacios
+    s = s.replace('$', '').replace(' ', '')
+    # Lógica Colombia: 
+    # 1. Si hay puntos, asumo que son miles y los quito (2.000.000 -> 2000000)
+    # 2. Si hay comas, asumo que son decimales y los vuelvo puntos (50,5 -> 50.5)
+    if '.' in s and ',' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif '.' in s:
+        # Caso peligroso: ¿Es 2.000 (dos mil) o 2.5 (dos punto cinco)?
+        # Asumimos formato COP: Puntos son miles.
+        if len(s.split('.')[-1]) == 3: # Es mil (ej: 2.000)
+            s = s.replace('.', '')
+        else: # Es decimal (ej: 2.5)
+            pass 
+    elif ',' in s:
+        s = s.replace(',', '.')
+    
+    try:
+        return float(s)
+    except:
+        return 0.0
+
 def fmt_money(x):
-    if pd.isna(x) or str(x).strip() == "": return "$ 0"
-    try: return "${:,.0f}".format(float(x)).replace(",", ".")
-    except: return str(x)
+    return "${:,.0f}".format(x).replace(",", ".")
 
-def clean_colombian_money(series):
-    s = series.astype(str).str.replace('$', '', regex=False).str.replace(' ', '', regex=False)
-    s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-    return pd.to_numeric(s, errors='coerce').fillna(0)
-
-def clean_text_key(series):
-    return series.astype(str).str.strip().str.upper()
-
+# --- CONEXIÓN ---
 def get_client():
     try:
         secrets = st.secrets["gcp_service_account"]
@@ -66,215 +58,190 @@ def get_client():
         return gspread.authorize(creds)
     except: return None
 
+# --- CARGA DE DATOS ---
 def load_data():
     client = get_client()
     if not client: return None, None, None, None
     try:
         sh = client.open("APP_SQR")
         
-        def get_df_robust(name, required_cols):
-            try:
-                ws = sh.worksheet(name)
-                data = ws.get_all_values()
-                if len(data) < 2: return pd.DataFrame(columns=required_cols)
-                headers = data[0]
-                rows = data[1:]
-                df = pd.DataFrame(rows, columns=headers)
-                df = df.loc[:, ~df.columns.duplicated()]
-                for col in required_cols:
-                    if col not in df.columns: df[col] = ""
-                df = df[required_cols].copy()
-                cols_num = [c for c in df.columns if any(x in c for x in ['Valor', 'Total', 'IVA', 'Monto', 'Pagado', 'Saldo', 'Base'])]
-                for c in cols_num: df[c] = clean_colombian_money(df[c])
-                return df
-            except: return pd.DataFrame(columns=required_cols)
+        def get_df(name, cols):
+            ws = sh.worksheet(name)
+            data = ws.get_all_values()
+            if len(data) < 2: return pd.DataFrame(columns=cols)
+            df = pd.DataFrame(data[1:], columns=data[0])
+            # Ajustar columnas si faltan o sobran
+            df = df.loc[:, ~df.columns.duplicated()]
+            for c in cols: 
+                if c not in df.columns: df[c] = ""
+            return df[cols] # Retornar solo columnas esperadas
 
-        cols_p = ['ID', 'Cliente', 'Proyecto', 'Total Venta', 'IVA Generado', 'Pagado Cliente', 'Saldo Pendiente', 'Estado', 'Tiene IVA']
-        cols_g = ['Fecha', 'Proyecto Asignado', 'Proveedor', 'Concepto', 'Base', 'IVA Descontable', 'Total Gasto', 'Categoria', 'Origen']
-        cols_n = ['Fecha', 'Proyecto', 'Especialista', 'Rol', 'Valor Pactado', 'Pagado', 'Saldo Debe']
+        # Definimos columnas ESTRICTAS para evitar errores
+        cols_p = ['Fecha', 'Cliente', 'Proyecto', 'Total Venta', 'IVA', 'Pagado', 'Estado']
+        cols_g = ['Fecha', 'Proyecto Asignado', 'Proveedor', 'Concepto', 'Base', 'IVA', 'Categoria']
+        cols_n = ['Fecha', 'Proyecto', 'Especialista', 'Rol', 'Valor Pactado', 'Pagado']
 
-        df_p = get_df_robust("proyectos", cols_p)
-        df_g = get_df_robust("gastos", cols_g)
-        df_n = get_df_robust("nomina", cols_n)
-        
-        if not df_p.empty: df_p['Key'] = clean_text_key(df_p['Proyecto'])
-        else: df_p['Key'] = ""
-        if not df_g.empty: df_g['Key'] = clean_text_key(df_g['Proyecto Asignado'])
-        else: df_g['Key'] = ""
-        if not df_n.empty: df_n['Key'] = clean_text_key(df_n['Proyecto'])
-        else: df_n['Key'] = ""
-        
+        df_p = get_df("proyectos", cols_p)
+        df_g = get_df("gastos", cols_g)
+        df_n = get_df("nomina", cols_n)
+
+        # --- LIMPIEZA Y CÁLCULO AUTOMÁTICO ---
+        # Proyectos
+        df_p['Total Venta'] = df_p['Total Venta'].apply(clean_money_value)
+        df_p['IVA'] = df_p['IVA'].apply(clean_money_value)
+        df_p['Pagado'] = df_p['Pagado'].apply(clean_money_value)
+        df_p['Total con IVA'] = df_p['Total Venta'] + df_p['IVA']
+        df_p['Saldo'] = df_p['Total con IVA'] - df_p['Pagado']
+
+        # Gastos
+        df_g['Base'] = df_g['Base'].apply(clean_money_value)
+        df_g['IVA'] = df_g['IVA'].apply(clean_money_value)
+        df_g['Total Gasto'] = df_g['Base'] + df_g['IVA'] # Calculado aquí, no leído
+
+        # Nómina
+        df_n['Valor Pactado'] = df_n['Valor Pactado'].apply(clean_money_value)
+        df_n['Pagado'] = df_n['Pagado'].apply(clean_money_value)
+        df_n['Saldo'] = df_n['Valor Pactado'] - df_n['Pagado']
+
         return df_p, df_g, df_n, sh
-    except: return None, None, None, None
+    except Exception as e:
+        st.error(f"Error cargando datos: {e}")
+        return None, None, None, None
 
-# --- ROBOT SIMPLIFICADO ---
-def run_email_sync(sheet_instance):
-    # Lógica de sincronización (simplificada para visualización)
+# --- FUNCIÓN DE GUARDADO (CRUD) ---
+def save_to_sheet(sh, sheet_name, df):
     try:
-        # ... (código de email igual al anterior) ...
-        return 0 # Placeholder
-    except: return 0
+        ws = sh.worksheet(sheet_name)
+        ws.clear() # Borrar todo
+        # Preparar datos para subir (convertir a string para evitar problemas de formato)
+        df_str = df.astype(str)
+        # Subir header + datos
+        data_to_upload = [df_str.columns.tolist()] + df_str.values.tolist()
+        ws.update(data_to_upload)
+        st.toast(f"✅ Cambios guardados en {sheet_name} exitosamente!")
+        return True
+    except Exception as e:
+        st.error(f"Error guardando: {e}")
+        return False
 
-# --- INTERFAZ PRINCIPAL ---
+# --- UI ---
 df_p, df_g, df_n, sh = load_data()
 
-# BARRA LATERAL SIMPLE
-st.sidebar.image("https://cdn-icons-png.flaticon.com/512/25/25694.png", width=50)
-st.sidebar.title("Menú Principal")
-menu = st.sidebar.radio("", ["🏠 Inicio", "🏗️ Proyectos", "💸 Gastos", "👷 Nómina"])
+st.sidebar.title("SQRapp Control 🛠️")
+menu = st.sidebar.radio("Ir a:", ["🏠 Dashboard", "🏗️ Proyectos (Editar)", "💸 Gastos (Editar)", "👥 Nómina (Editar)"])
 
-st.sidebar.divider()
-if st.sidebar.button("🔄 Actualizar Datos"):
-    st.cache_data.clear()
+if st.sidebar.button("🔄 Recargar Datos"):
     st.rerun()
 
-# --- 1. INICIO ---
-if menu == "🏠 Inicio":
-    st.title("Bienvenido a SQRapp")
-    st.write("Aquí tienes el resumen de tu empresa hoy.")
+# --- 1. DASHBOARD ---
+if menu == "🏠 Dashboard":
+    st.title("Resumen Ejecutivo")
     
-    # Tarjetas Grandes
-    c1, c2, c3 = st.columns(3)
+    # KPIs
     ventas = df_p['Total Venta'].sum()
     gastos = df_g['Base'].sum()
     utilidad = ventas - gastos
     
-    c1.metric("💰 Total Vendido", fmt_money(ventas))
-    c2.metric("📉 Total Gastado", fmt_money(gastos))
-    c3.metric("📈 Ganancia Neta", fmt_money(utilidad))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Ventas (Subtotal)", fmt_money(ventas))
+    c2.metric("Gastos (Subtotal)", fmt_money(gastos))
+    c3.metric("Utilidad Bruta", fmt_money(utilidad), delta_color="normal")
     
     st.divider()
-    st.subheader("📊 ¿Cómo va la plata?")
     
-    # Gráfico simple
-    if not df_p.empty:
-        # Preparar datos
-        p_resumen = df_p[['Proyecto', 'Total Venta']].copy()
-        p_resumen['Gastos'] = 0
+    # Selector de Proyecto para ver detalle rápido
+    st.subheader("🔍 Lupa por Proyecto")
+    proy_sel = st.selectbox("Selecciona Proyecto:", ["Todos"] + df_p['Proyecto'].unique().tolist())
+    
+    if proy_sel != "Todos":
+        # Filtrar
+        p_data = df_p[df_p['Proyecto'] == proy_sel]
+        g_data = df_g[df_g['Proyecto Asignado'] == proy_sel]
         
-        # Sumar gastos por proyecto
-        if not df_g.empty:
-            g_sum = df_g.groupby('Key')['Base'].sum()
-            p_resumen['Key'] = clean_text_key(p_resumen['Proyecto'])
-            p_resumen['Gastos'] = p_resumen['Key'].map(g_sum).fillna(0)
+        # Métricas del proyecto
+        v_p = p_data['Total Venta'].sum()
+        g_p = g_data['Base'].sum()
         
-        # Graficar
-        fig = px.bar(p_resumen, x='Proyecto', y=['Total Venta', 'Gastos'], barmode='group', title="Ventas vs Gastos por Proyecto")
-        st.plotly_chart(fig, use_container_width=True)
-
-# --- 2. PROYECTOS ---
-elif menu == "🏗️ Proyectos":
-    st.title("Mis Proyectos")
-    
-    # PESTAÑAS CLARAS: VER vs CREAR
-    tab_ver, tab_crear, tab_detalle = st.tabs(["📂 VER LISTADO", "➕ CREAR NUEVO", "🔍 DETALLE 360°"])
-    
-    with tab_ver:
-        st.dataframe(df_p[['Proyecto', 'Cliente', 'Total Venta', 'Saldo Pendiente']].style.format(fmt_money), use_container_width=True)
-    
-    with tab_crear:
-        st.write("### 📝 Registrar Nueva Obra")
-        with st.form("form_proyecto"):
-            col1, col2 = st.columns(2)
-            nombre = col1.text_input("Nombre de la Obra (Ej: Camaras Edificio X)")
-            cliente = col2.text_input("Nombre del Cliente")
-            
-            col3, col4 = st.columns(2)
-            valor = col3.number_input("Valor del Contrato (Antes de IVA)", min_value=0)
-            iva_opcion = col4.radio("¿Lleva IVA?", ["Sí (19%)", "No (0%)"], horizontal=True)
-            
-            if st.form_submit_button("🚀 Crear Proyecto Ahora"):
-                iva = valor * 0.19 if "Sí" in iva_opcion else 0
-                total = valor + iva
-                sh.worksheet("proyectos").append_row([
-                    int(datetime.now().timestamp()), cliente, nombre, valor, iva, 0, total, "Activo", "Sí" if "Sí" in iva_opcion else "No"
-                ])
-                st.success(f"¡Proyecto {nombre} creado con éxito!")
-                st.balloons()
-                st.rerun()
-
-    with tab_detalle:
-        st.info("Selecciona un proyecto para ver sus cuentas específicas.")
-        sel_proy = st.selectbox("Seleccionar Proyecto:", df_p['Proyecto'].unique())
+        col1, col2 = st.columns(2)
+        col1.info(f"Vendido: {fmt_money(v_p)}")
+        col2.warning(f"Gastado: {fmt_money(g_p)}")
         
-        # Filtrar datos
-        key = clean_text_key(pd.Series([sel_proy]))[0]
-        mis_gastos = df_g[df_g['Key'] == key]
-        
-        st.write(f"**Gastos de: {sel_proy}**")
-        if not mis_gastos.empty:
-            st.dataframe(mis_gastos[['Fecha', 'Proveedor', 'Concepto', 'Total Gasto']].style.format({'Total Gasto': fmt_money}), use_container_width=True)
-            st.metric("Total Gastado en esta obra", fmt_money(mis_gastos['Total Gasto'].sum()))
-        else:
-            st.warning("No hay gastos registrados en esta obra aún.")
+        st.write("📋 **Últimos Gastos de este proyecto:**")
+        st.dataframe(g_data[['Fecha', 'Proveedor', 'Concepto', 'Total Gasto']])
+    else:
+        st.info("Selecciona un proyecto arriba para ver sus cuentas específicas.")
 
-# --- 3. GASTOS ---
-elif menu == "💸 Gastos":
-    st.title("Control de Gastos")
+# --- 2. PROYECTOS (CRUD) ---
+elif menu == "🏗️ Proyectos (Editar)":
+    st.title("Gestión de Proyectos")
+    st.info("💡 Puedes editar las celdas directamente. Para borrar una fila, selecciónala y presiona Supr. Al final, pulsa 'Guardar Cambios'.")
     
-    tab_reg, tab_hist = st.tabs(["📝 REGISTRAR GASTO", "📊 VER HISTORIAL"])
+    # Editor
+    edited_p = st.data_editor(
+        df_p,
+        num_rows="dynamic", # Permite agregar filas
+        column_config={
+            "Total Venta": st.column_config.NumberColumn(format="$%d"),
+            "IVA": st.column_config.NumberColumn(format="$%d"),
+            "Pagado": st.column_config.NumberColumn(format="$%d"),
+            "Total con IVA": st.column_config.NumberColumn(format="$%d", disabled=True), # Calculado
+            "Saldo": st.column_config.NumberColumn(format="$%d", disabled=True), # Calculado
+            "Estado": st.column_config.SelectboxColumn(options=["Activo", "Finalizado", "Cotización"])
+        },
+        use_container_width=True,
+        key="editor_proyectos"
+    )
     
-    with tab_reg:
-        st.write("### 🧾 Nuevo Gasto o Compra")
-        with st.form("form_gasto"):
-            # 1. ¿Para quién es el gasto?
-            st.markdown("#### 1. ¿A qué proyecto pertenece?")
-            lista_proyectos = ["Gasto General (Oficina/Varios)"] + df_p['Proyecto'].unique().tolist()
-            proyecto_destino = st.selectbox("Selecciona el Proyecto:", lista_proyectos)
-            
-            st.divider()
-            
-            # 2. Detalles
-            st.markdown("#### 2. Datos de la Factura")
-            c1, c2, c3 = st.columns(3)
-            fecha = c1.date_input("Fecha")
-            proveedor = c2.text_input("Proveedor (Ej: Homecenter)")
-            concepto = c3.text_input("¿Qué se compró? (Ej: Cable UTP)")
-            
-            # 3. Plata
-            st.divider()
-            st.markdown("#### 3. ¿Cuánto costó?")
-            cc1, cc2 = st.columns(2)
-            valor_pagado = cc1.number_input("Valor TOTAL Pagado", min_value=0)
-            tiene_iva = cc2.checkbox("¿La factura tiene IVA discriminado?")
-            
-            categoria = st.selectbox("Categoría", ["Materiales", "Transporte", "Alimentación", "Mano de Obra Extra", "Servicios"])
-            
-            if st.form_submit_button("💾 Guardar Gasto"):
-                base = valor_pagado / 1.19 if tiene_iva else valor_pagado
-                iva = valor_pagado - base if tiene_iva else 0
-                
-                sh.worksheet("gastos").append_row([
-                    str(fecha), proyecto_destino, proveedor, concepto, base, iva, valor_pagado, categoria, "Manual"
-                ])
-                st.success("¡Gasto guardado correctamente!")
-                st.rerun()
-    
-    with tab_hist:
-        st.dataframe(df_g[['Fecha', 'Proyecto Asignado', 'Proveedor', 'Concepto', 'Total Gasto']].style.format({'Total Gasto': fmt_money}), use_container_width=True)
+    if st.button("💾 GUARDAR CAMBIOS EN PROYECTOS", type="primary"):
+        # Recalcular antes de guardar para asegurar consistencia
+        save_to_sheet(sh, "proyectos", edited_p[['Fecha', 'Cliente', 'Proyecto', 'Total Venta', 'IVA', 'Pagado', 'Estado']])
+        st.rerun()
 
-# --- 4. NÓMINA ---
-elif menu == "👷 Nómina":
-    st.title("Equipo de Trabajo")
+# --- 3. GASTOS (CRUD) ---
+elif menu == "💸 Gastos (Editar)":
+    st.title("Gestión de Gastos")
+    st.info("💡 Edita montos, proveedores o asigna proyectos aquí.")
     
-    tab_pagar, tab_asignar = st.tabs(["💰 PAGAR A GENTE", "👷 ASIGNAR TRABAJO"])
+    # Lista de proyectos para el dropdown
+    lista_proyectos = df_p['Proyecto'].unique().tolist()
+    if "Gasto General" not in lista_proyectos: lista_proyectos.append("Gasto General")
     
-    with tab_asignar:
-        with st.form("form_nomina"):
-            st.write("### Asignar Tarea a Empleado")
-            c1, c2 = st.columns(2)
-            nombre = c1.text_input("Nombre del Trabajador")
-            rol = c2.selectbox("Rol", ["Técnico", "Ayudante", "Ingeniero"])
-            
-            proy = st.selectbox("¿En qué proyecto va a trabajar?", df_p['Proyecto'].unique())
-            valor = st.number_input("¿Cuánto se le va a pagar?", min_value=0)
-            
-            if st.form_submit_button("Asignar"):
-                sh.worksheet("nomina").append_row([str(datetime.now().date()), nombre, rol, proy, valor, 0, valor])
-                st.success("Asignado correctamente")
-                st.rerun()
-                
-    with tab_pagar:
-        st.write("### Estado de Cuentas")
-        resumen_nomina = df_n.groupby(['Especialista'])[['Valor Pactado', 'Pagado', 'Saldo Debe']].sum().reset_index()
-        st.dataframe(resumen_nomina.style.format(fmt_money), use_container_width=True)
+    edited_g = st.data_editor(
+        df_g,
+        num_rows="dynamic",
+        column_config={
+            "Proyecto Asignado": st.column_config.SelectboxColumn(options=lista_proyectos, required=True),
+            "Base": st.column_config.NumberColumn(format="$%d", help="Valor antes de IVA"),
+            "IVA": st.column_config.NumberColumn(format="$%d"),
+            "Total Gasto": st.column_config.NumberColumn(format="$%d", disabled=True), # Calculado
+            "Categoria": st.column_config.SelectboxColumn(options=["Materiales", "Mano de Obra", "Transporte", "Alimentación", "Servicios", "Equipos"])
+        },
+        use_container_width=True,
+        key="editor_gastos"
+    )
+    
+    if st.button("💾 GUARDAR CAMBIOS EN GASTOS", type="primary"):
+        # Guardamos solo las columnas base, el total se recalcula al leer
+        save_to_sheet(sh, "gastos", edited_g[['Fecha', 'Proyecto Asignado', 'Proveedor', 'Concepto', 'Base', 'IVA', 'Categoria']])
+        st.rerun()
+
+# --- 4. NÓMINA (CRUD) ---
+elif menu == "👥 Nómina (Editar)":
+    st.title("Gestión de Nómina")
+    
+    edited_n = st.data_editor(
+        df_n,
+        num_rows="dynamic",
+        column_config={
+            "Proyecto": st.column_config.SelectboxColumn(options=df_p['Proyecto'].unique().tolist()),
+            "Valor Pactado": st.column_config.NumberColumn(format="$%d"),
+            "Pagado": st.column_config.NumberColumn(format="$%d"),
+            "Saldo": st.column_config.NumberColumn(format="$%d", disabled=True)
+        },
+        use_container_width=True,
+        key="editor_nomina"
+    )
+    
+    if st.button("💾 GUARDAR CAMBIOS EN NÓMINA", type="primary"):
+        save_to_sheet(sh, "nomina", edited_n[['Fecha', 'Proyecto', 'Especialista', 'Rol', 'Valor Pactado', 'Pagado']])
+        st.rerun()
