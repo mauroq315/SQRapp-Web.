@@ -3,4 +3,5 @@ pandas
 plotly
 gspread
 google-auth
-toml
+google-auth-oauthlib
+google-auth-httplib2
